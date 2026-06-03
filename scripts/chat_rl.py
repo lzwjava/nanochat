@@ -19,7 +19,6 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
 import argparse
 import os
 import itertools
-import wandb
 import torch
 import torch.distributed as dist
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
@@ -32,6 +31,9 @@ from tasks.gsm8k import GSM8K
 parser = argparse.ArgumentParser(description="Reinforcement learning on GSM8K")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--tracker", type=str, default="wandb", choices=["wandb", "mlflow", "none"], help="experiment tracker: wandb, mlflow, or none")
+parser.add_argument("--mlflow-uri", type=str, default=None, help="MLflow tracking server URI (default: local file store)")
+parser.add_argument("--mlflow-experiment", type=str, default="nanochat-rl", help="MLflow experiment name")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # Model loading
@@ -66,9 +68,20 @@ device_type = autodetect_device_type() if args.device_type == "" else args.devic
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 
-# wandb logging init
-use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl", name=args.run, config=user_config)
+# experiment tracker init
+if args.tracker == "none" or args.run == "dummy" or not master_process:
+    wandb_run = DummyWandb()
+elif args.tracker == "mlflow":
+    from nanochat.mlflow_logger import MLflowLogger
+    wandb_run = MLflowLogger(
+        experiment=args.mlflow_experiment,
+        run_name=args.run,
+        config=user_config,
+        tracking_uri=args.mlflow_uri,
+    )
+else:  # wandb
+    import wandb
+    wandb_run = wandb.init(project="nanochat-rl", name=args.run, config=user_config)
 
 # Init model and tokenizer
 model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step)

@@ -21,7 +21,6 @@ import argparse
 from dataclasses import asdict
 from contextlib import contextmanager
 
-import wandb
 import torch
 import torch.distributed as dist
 
@@ -41,6 +40,9 @@ print_banner()
 parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--tracker", type=str, default="wandb", choices=["wandb", "mlflow", "none"], help="experiment tracker: wandb, mlflow, or none")
+parser.add_argument("--mlflow-uri", type=str, default=None, help="MLflow tracking server URI (default: local file store)")
+parser.add_argument("--mlflow-experiment", type=str, default="nanochat", help="MLflow experiment name")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # FP8 training
@@ -95,9 +97,20 @@ else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
-# wandb logging init
-use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+# experiment tracker init
+if args.tracker == "none" or args.run == "dummy" or not master_process:
+    wandb_run = DummyWandb()
+elif args.tracker == "mlflow":
+    from nanochat.mlflow_logger import MLflowLogger
+    wandb_run = MLflowLogger(
+        experiment=args.mlflow_experiment,
+        run_name=args.run,
+        config=user_config,
+        tracking_uri=args.mlflow_uri,
+    )
+else:  # wandb
+    import wandb
+    wandb_run = wandb.init(project="nanochat", name=args.run, config=user_config)
 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
