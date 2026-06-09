@@ -24,10 +24,15 @@ torchao is just orchestration around these primitives. We can call them directly
 FP8 dtype choice
 ================
 There are two FP8 formats. We use both, following the standard convention:
-  - float8_e4m3fn: 4-bit exponent, 3-bit mantissa, range [-448, 448]
+  - float8_e4m3fn(e4m3fnuz on AMD): 4-bit exponent, 3-bit mantissa
     Higher precision (more mantissa bits), used for input and weight.
-  - float8_e5m2:   5-bit exponent, 2-bit mantissa, range [-57344, 57344]
+    NVIDIA range: [-448, 448], AMD range: [-240, 240]
+  - float8_e5m2(e5m2fnuz on AMD): 5-bit exponent, 2-bit mantissa
     Wider range (more exponent bits), used for gradients which can be large.
+    Range: [-57344, 57344] on both platforms.
+
+AMD/ROCm note: AMD uses the "fnuz" (unsigned zero) variants of FP8.
+We auto-detect the platform and select the appropriate dtypes.
 
 torch._scaled_mm layout requirements
 =====================================
@@ -76,6 +81,13 @@ from nanochat.common import COMPUTE_DTYPE
 
 # Avoid division by zero when computing scale from an all-zeros tensor
 EPS = 1e-12
+
+# Auto-detect AMD (ROCm) vs NVIDIA (CUDA) for FP8 dtype selection
+# AMD uses "fnuz" (unsigned zero) variants: float8_e4m3fnuz, float8_e5m2fnuz
+# NVIDIA uses standard variants: float8_e4m3fn, float8_e5m2
+_IS_AMD = torch.cuda.is_available() and hasattr(torch.version, 'hip') and torch.version.hip is not None
+FP8_E4M3 = torch.float8_e4m3fnuz if _IS_AMD else torch.float8_e4m3fn
+FP8_E5M2 = torch.float8_e5m2fnuz if _IS_AMD else torch.float8_e5m2
 
 
 @torch.no_grad()
@@ -132,8 +144,9 @@ class _Float8Matmul(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input_2d, weight):
         # Quantize both operands to e4m3 (higher precision format)
-        input_fp8, input_inv = _to_fp8(input_2d, torch.float8_e4m3fn)
-        weight_fp8, weight_inv = _to_fp8(weight, torch.float8_e4m3fn)
+        # Uses e4m3fnuz on AMD, e4m3fn on NVIDIA
+        input_fp8, input_inv = _to_fp8(input_2d, FP8_E4M3)
+        weight_fp8, weight_inv = _to_fp8(weight, FP8_E4M3)
         ctx.save_for_backward(input_fp8, input_inv, weight_fp8, weight_inv)
 
         # output = input @ weight.T
@@ -160,7 +173,8 @@ class _Float8Matmul(torch.autograd.Function):
         # === GEMM 1: grad_input = grad_output @ weight ===
         # Shapes: [B, N] @ [N, K] -> [B, K]
         # Gradients use e5m2 (wider range), weights use e4m3 (higher precision)
-        go_fp8, go_inv = _to_fp8(grad_output, torch.float8_e5m2)
+        # Uses e5m2fnuz on AMD, e5m2 on NVIDIA
+        go_fp8, go_inv = _to_fp8(grad_output, FP8_E5M2)
         # go_fp8 is [B, N] contiguous = row-major, good for first arg
         # w_fp8 is [N, K] contiguous = row-major, need column-major for second arg
         w_col = _to_col_major(w_fp8)
