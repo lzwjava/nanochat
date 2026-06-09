@@ -113,17 +113,19 @@ else:  # wandb
     wandb_run = wandb.init(project="nanochat", name=args.run, config=user_config)
 
 # Flash Attention status
-from nanochat.flash_attention import USE_FA3
+from nanochat.flash_attention import USE_FA3, USE_FA2, HAS_FA2
 using_fa3 = USE_FA3
+using_fa2 = USE_FA2
 if using_fa3:
     print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
+elif using_fa2:
+    print0("✓ Using Flash Attention 2 (flash-attn package detected).")
+    if args.window_pattern != "L":
+        print0(f"  Note: FA2 supports sliding window (window_pattern='{args.window_pattern}').")
 else:
     print0("!" * 80)
-    if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
-        print0(f"WARNING: Flash Attention 3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
-    else:
-        print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
-    print0("WARNING: Training will be less efficient without FA3")
+    print0("WARNING: No Flash Attention available, using PyTorch SDPA fallback")
+    print0("WARNING: Training will be less efficient without Flash Attention")
     if args.window_pattern != "L":
         print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
         print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")

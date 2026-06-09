@@ -1,8 +1,12 @@
 """
-Unified Flash Attention interface with automatic FA3/SDPA switching.
+Unified Flash Attention interface with automatic FA3/FA2/SDPA switching.
 
-Exports `flash_attn` module that matches the FA3 API exactly, but falls back
-to PyTorch SDPA on non-Hopper GPUs (including Blackwell), MPS, and CPU.
+Priority order:
+  1. Flash Attention 3 (NVIDIA Hopper SM90 only)
+  2. Flash Attention 2 (NVIDIA CUDA + AMD ROCm via flash-attn package)
+  3. PyTorch SDPA fallback (all platforms)
+
+Exports `flash_attn` module that matches the FA3 API exactly.
 
 Usage (drop-in replacement for FA3):
     from nanochat.flash_attention import flash_attn
@@ -18,7 +22,7 @@ import torch.nn.functional as F
 
 
 # =============================================================================
-# Detection: Try to load FA3 on Hopper+ GPUs
+# Detection: Try to load FA3 (Hopper), then FA2 (all GPUs including AMD)
 # =============================================================================
 def _load_flash_attention_3():
     """Try to load Flash Attention 3 (requires Hopper GPU, sm90)."""
@@ -38,29 +42,61 @@ def _load_flash_attention_3():
         return None
 
 
+def _load_flash_attention_2():
+    """Try to load Flash Attention 2 (works on NVIDIA CUDA + AMD ROCm)."""
+    if not torch.cuda.is_available():
+        return None
+    try:
+        import flash_attn
+        from flash_attn import flash_attn_func as fa2_func
+        from flash_attn.flash_attn_interface import flash_attn_varlen_func
+        # Test that it actually works (not just importable)
+        # Return a simple namespace with the functions we need
+        return flash_attn
+    except Exception:
+        return None
+
+
 _fa3 = _load_flash_attention_3()
 HAS_FA3 = _fa3 is not None
 
-# Override for testing: set to 'fa3', 'sdpa', or None (auto)
+_fa2 = _load_flash_attention_2() if not HAS_FA3 else None
+HAS_FA2 = _fa2 is not None
+
+# Override for testing: set to 'fa3', 'fa2', 'sdpa', or None (auto)
 _override_impl = None
 
 
-def _resolve_use_fa3():
-    """Decide once whether to use FA3, based on availability, override, and dtype."""
+def _resolve_impl():
+    """Decide which attention implementation to use."""
     if _override_impl == 'fa3':
         assert HAS_FA3, "Cannot override to FA3: not available on this hardware"
-        return True
+        return 'fa3'
+    if _override_impl == 'fa2':
+        assert HAS_FA2, "Cannot override to FA2: flash-attn package not installed"
+        return 'fa2'
     if _override_impl == 'sdpa':
-        return False
+        return 'sdpa'
     if HAS_FA3:
-        # FA3 Hopper kernels only support bf16 and fp8; fp16/fp32 must use SDPA fallback
         from nanochat.common import COMPUTE_DTYPE
         if COMPUTE_DTYPE == torch.bfloat16:
-            return True
-        return False
-    return False
+            return 'fa3'
+    if HAS_FA2:
+        return 'fa2'
+    return 'sdpa'
 
-USE_FA3 = _resolve_use_fa3()
+_active_impl = _resolve_impl()
+USE_FA3 = _active_impl == 'fa3'
+USE_FA2 = _active_impl == 'fa2'
+
+if USE_FA3:
+    print("✓ Using Flash Attention 3 (Hopper GPU)")
+elif USE_FA2:
+    _is_amd = hasattr(torch.version, 'hip') and torch.version.hip is not None
+    _backend = "AMD ROCm" if _is_amd else "NVIDIA CUDA"
+    print(f"✓ Using Flash Attention 2 ({_backend})")
+else:
+    print("! Using PyTorch SDPA fallback (no flash-attn found)")
 
 
 # =============================================================================
@@ -101,6 +137,16 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
 
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
 
+
+# =============================================================================
+# FA2 helper: convert window_size format
+# =============================================================================
+def _fa2_window_size(window_size):
+    """Convert FA3 window_size format (-1,-1) to FA2 format (-1,-1) or (left, right)."""
+    # FA2 uses the same (-1, -1) for unlimited
+    return (window_size[0], window_size[1]) if window_size[0] >= 0 else (-1, -1)
+
+
 # =============================================================================
 # Public API: Same interface as FA3
 # =============================================================================
@@ -118,6 +164,17 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     """
     if USE_FA3:
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+
+    if USE_FA2:
+        # FA2 API: flash_attn_func(q, k, v, ..., window_size=(left, right))
+        # q, k, v: (B, T, H, D) - same as FA3
+        # dropout_p=0.0 for training (no dropout in attention)
+        return _fa2.flash_attn_func(
+            q, k, v,
+            dropout_p=0.0,
+            causal=causal,
+            window_size=_fa2_window_size(window_size),
+        )
 
     # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
     q = q.transpose(1, 2)
@@ -150,6 +207,15 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
         return _fa3.flash_attn_with_kvcache(
             q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
             causal=causal, window_size=window_size
+        )
+
+    if USE_FA2:
+        # FA2 has flash_attn_with_kvcache with similar API
+        return _fa2.flash_attn_with_kvcache(
+            q, k_cache, v_cache, k=k, v=v,
+            cache_seqlens=cache_seqlens,
+            causal=causal,
+            window_size=_fa2_window_size(window_size),
         )
 
     # SDPA fallback: manually manage KV cache
