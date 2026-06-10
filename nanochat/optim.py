@@ -296,6 +296,23 @@ class MuonAdamW(torch.optim.Optimizer):
 # Distributed version of the MuonAdamW optimizer.
 # Used for training on multiple GPUs.
 
+
+# Gloo compatibility: wrap async ops so .wait() works without .get_future()
+class _AsyncWorkWrapper:
+    """Wraps a dist.Work object to provide a .wait() interface."""
+    def __init__(self, work):
+        self._work = work
+    def wait(self):
+        self._work.wait()
+        return None
+
+def _async_op(work):
+    """Convert async work to future-like. NCCL supports get_future(), Gloo does not."""
+    try:
+        return work.get_future()
+    except RuntimeError:
+        return _AsyncWorkWrapper(work)
+
 class DistMuonAdamW(torch.optim.Optimizer):
     """
     Combined distributed optimizer: Muon for 2D matrix params, AdamW for others.
@@ -375,14 +392,14 @@ class DistMuonAdamW(torch.optim.Optimizer):
             grad = p.grad
             if p.numel() < 1024:
                 # Small params: all_reduce (no scatter/gather needed)
-                future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
+                future = _async_op(dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True))
                 param_infos[p] = dict(future=future, grad_slice=grad, is_small=True)
             else:
                 # Large params: reduce_scatter
                 assert grad.shape[0] % world_size == 0, f"AdamW reduce_scatter requires shape[0] ({grad.shape[0]}) divisible by world_size ({world_size})"
                 rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])
-                future = dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
+                future = _async_op(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True))
                 param_infos[p] = dict(future=future, grad_slice=grad_slice, is_small=False)
         return dict(param_infos=param_infos)
 
@@ -403,7 +420,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
         # Reduce_scatter to get this rank's chunk
         grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
-        future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
+        future = _async_op(dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True))
 
         return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size)
 
@@ -445,7 +462,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
             # Large params need all_gather
             if not pinfo['is_small']:
-                future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
+                future = _async_op(dist.all_gather_into_tensor(p, p_slice, async_op=True))
                 gather_list.append(dict(future=future, params=None))
 
     def _compute_muon(self, group: dict, info: dict, gather_list: list, rank: int) -> None:
@@ -495,7 +512,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
         # Reuse stacked_grads buffer for all_gather output
         stacked_params = info["stacked_grads"]
-        future = dist.all_gather_into_tensor(stacked_params, updated_params, async_op=True).get_future()
+        future = _async_op(dist.all_gather_into_tensor(stacked_params, updated_params, async_op=True))
         gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
 
     def _finish_gathers(self, gather_list: list) -> None:

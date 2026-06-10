@@ -69,6 +69,10 @@ _override_impl = None
 
 def _resolve_impl():
     """Decide which attention implementation to use."""
+    import os as _os
+    if _os.environ.get("NANOCHAT_FORCE_SDPA", "").lower() in ("1", "true", "yes"):
+        return "sdpa"
+
     if _override_impl == 'fa3':
         assert HAS_FA3, "Cannot override to FA3: not available on this hardware"
         return 'fa3'
