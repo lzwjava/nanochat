@@ -1,8 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # Multi-Node CPU DDP Training — WORKER node (192.168.1.47)
-# =============================================================================
-# Run AFTER the master is started on 192.168.1.36.
+# Model: d8 (~80M params, depth=8, dim=512, heads=4, seq=1024)
 # =============================================================================
 
 set -e
@@ -14,15 +13,28 @@ export NANOCHAT_FORCE_SDPA=1
 export NANOCHAT_DTYPE=float32
 export OMP_NUM_THREADS=4
 export PYTHONUNBUFFERED=1
-export GLOO_SOCKET_IFNAME=wlp3s0
+export GLOO_SOCKET_IFNAME=enx00e04c362f89
 
 echo "=== WORKER (rank 1) ==="
+echo "Model: d8 (~80M params)"
+
 torchrun \
     --nnodes=2 --nproc_per_node=1 --node_rank=1 \
     --master_addr=192.168.1.36 --master_port=29500 \
     -m scripts.base_train -- \
-    --device-type cpu --depth 4 --aspect-ratio 64 --head-dim 64 \
-    --max-seq-len 512 --device-batch-size 2 --total-batch-size 2048 \
-    --num-iterations 20 --eval-every 10 --eval-tokens 2048 \
-    --core-metric-every -1 --sample-every 20 \
-    --tracker none --run dist-cpu-2node-full
+    --device-type cpu \
+    --depth 8 \
+    --aspect-ratio 64 \
+    --head-dim 128 \
+    --max-seq-len 1024 \
+    --device-batch-size 2 \
+    --total-batch-size 4096 \
+    --num-iterations 5000 \
+    --eval-every 500 \
+    --eval-tokens 65536 \
+    --core-metric-every 2000 \
+    --core-metric-max-per-task 100 \
+    --sample-every 1000 \
+    --save-every 1000 \
+    --tracker none \
+    --run dist-cpu-d8-2node
